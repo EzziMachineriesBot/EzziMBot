@@ -1,146 +1,115 @@
+
 const express = require('express');
 const bodyParser = require('body-parser');
-const axios = require('axios');
+const { GoogleAuth } = require('google-auth-library');
+const { SessionsClient } = require('@google-cloud/dialogflow');
 const { google } = require('googleapis');
-const dotenv = require('dotenv');
-dotenv.config();
+const axios = require('axios');
 
 const app = express();
 app.use(bodyParser.json());
-const { GoogleAuth } = require('google-auth-library');
 
+// ✅ Google Auth from ENV
 const auth = new GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
   scopes: ['https://www.googleapis.com/auth/cloud-platform'],
 });
 
-const PORT = process.env.PORT || 3000;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID;
-const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
-const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
-const SHEET_ID = process.env.SHEET_ID;
-const SHEET_RANGE = process.env.SHEET_RANGE || 'Sheet1!A2:B';
+// ✅ Dialogflow Session Client
+const sessionClient = new SessionsClient({ auth });
 
-async function checkTakeoverMode(phone) {
-  const auth = new google.auth.JWT(
-    CLIENT_EMAIL,
-    null,
-    PRIVATE_KEY,
-    ['https://www.googleapis.com/auth/spreadsheets.readonly']
-  );
-  const sheets = google.sheets({ version: 'v4', auth });
+// ✅ Google Sheet Logger
+const logToSheet = async (number, text, botReply) => {
+  try {
+    const authClient = await auth.getClient();
+    const sheets = google.sheets({ version: 'v4', auth: authClient });
 
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: SHEET_RANGE,
-  });
-
-  const rows = response.data.values;
-  if (rows && rows.length > 0) {
-    for (const row of rows) {
-      if (row[0] === phone) {
-        return row[1].toLowerCase(); // should be "bot" or "manual"
-      }
-    }
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.SHEET_ID,
+      range: 'Sheet1!A:D',
+      valueInputOption: 'RAW',
+      requestBody: {
+        values: [[new Date().toISOString(), number, text, botReply]],
+      },
+    });
+  } catch (error) {
+    console.error('❌ Error logging to sheet:', error.message);
   }
-  return 'bot'; // default to bot if not found
-}
+};
 
-app.get('/', (req, res) => {
-  res.send('Ezzi WhatsApp Bot with Sheet Control is Live!');
+// ✅ Webhook route
+app.post('/webhook', async (req, res) => {
+  try {
+    const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+
+    if (!message || !message.from || !message.text) {
+      return res.sendStatus(200);
+    }
+
+    const senderId = message.from;
+    const userText = message.text.body;
+    const sessionPath = sessionClient.projectAgentSessionPath(
+      process.env.DIALOGFLOW_PROJECT_ID,
+      senderId
+    );
+
+    const responses = await sessionClient.detectIntent({
+      session: sessionPath,
+      queryInput: {
+        text: { text: userText, languageCode: 'en' },
+      },
+    });
+
+    const reply = responses[0].queryResult.fulfillmentText;
+
+    await logToSheet(senderId, userText, reply);
+    await sendMessage(senderId, reply);
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('❌ Webhook Error:', err);
+    res.sendStatus(500);
+  }
 });
 
+// ✅ WhatsApp Reply Sender
+const sendMessage = async (to, message) => {
+  try {
+    await axios.post(
+      'https://graph.facebook.com/v19.0/' + process.env.PHONE_NUMBER_ID + '/messages',
+      {
+        messaging_product: 'whatsapp',
+        to,
+        text: { body: message },
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        },
+      }
+    );
+  } catch (error) {
+    console.error('❌ WhatsApp send error:', error.response?.data || error.message);
+  }
+};
+
+// ✅ Meta Webhook Verification
 app.get('/webhook', (req, res) => {
+  const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('Webhook verified');
+  if (mode && token && mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('✅ Webhook verified!');
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
   }
 });
 
-app.post('/webhook', async (req, res) => {
-  const body = req.body;
-
-  if (body.object) {
-    const entry = body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const message = changes?.value?.messages?.[0];
-
-    if (message && message.type === 'text') {
-      const phone_number_id = changes.value.metadata.phone_number_id;
-      const from = message.from;
-      const text = message.text.body;
-
-      const mode = await checkTakeoverMode(from);
-      if (mode === 'manual') {
-        console.log(`Manual takeover active for ${from}`);
-        return res.sendStatus(200);
-      }
-
-      const sessionId = from;
-
-      const jwtClient = new google.auth.JWT(
-        CLIENT_EMAIL,
-        null,
-        PRIVATE_KEY,
-        ['https://www.googleapis.com/auth/cloud-platform']
-      );
-
-      await jwtClient.authorize();
-
-      const dialogflowUrl = `https://dialogflow.googleapis.com/v2/projects/${PROJECT_ID}/agent/sessions/${sessionId}:detectIntent`;
-
-      try {
-        const dfResponse = await axios.post(
-          dialogflowUrl,
-          {
-            queryInput: {
-              text: {
-                text: text,
-                languageCode: 'en-US',
-              },
-            },
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${jwtClient.credentials.access_token}`,
-            },
-          }
-        );
-
-        const replyText = dfResponse.data.queryResult.fulfillmentText;
-
-        await axios.post(
-          `https://graph.facebook.com/v18.0/${phone_number_id}/messages`,
-          {
-            messaging_product: 'whatsapp',
-            to: from,
-            text: { body: replyText },
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-            },
-          }
-        );
-      } catch (error) {
-        console.error('Dialogflow/WhatsApp Error:', error?.response?.data || error.message);
-      }
-    }
-
-    res.sendStatus(200);
-  } else {
-    res.sendStatus(404);
-  }
-});
-
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`✅ Server running on port ${PORT}`);
 });
