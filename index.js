@@ -7,6 +7,12 @@ dotenv.config();
 
 const app = express();
 app.use(bodyParser.json());
+const { GoogleAuth } = require('google-auth-library');
+
+const auth = new GoogleAuth({
+  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
+  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+});
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
